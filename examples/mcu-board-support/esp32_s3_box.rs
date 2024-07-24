@@ -4,22 +4,20 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::RefCell;
-use display_interface_spi::SPIInterfaceNoCS;
+use display_interface_spi::SPIInterface;
 use embedded_graphics_core::geometry::OriginDimensions;
-use embedded_hal::digital::v2::OutputPin;
-use esp32s3_hal::{
-    clock::{ClockControl, CpuClock},
-    i2c::I2C,
-    peripherals::Peripherals,
-    prelude::*,
-    spi::{Spi, SpiMode},
-    systimer::SystemTimer,
-    timer::TimerGroup,
-    Delay, Rtc, IO,
-};
+use embedded_hal::digital::OutputPin;
 use esp_alloc::EspHeap;
 use esp_backtrace as _;
-use mipidsi::{Display, Orientation};
+use esp_hal::clock::ClockControl;
+use esp_hal::delay::Delay;
+use esp_hal::gpio::Io;
+use esp_hal::rtc_cntl::Rtc;
+use esp_hal::spi::{master::Spi, SpiMode};
+use esp_hal::system::SystemControl;
+use esp_hal::timer::{systimer::SystemTimer, timg::TimerGroup};
+use esp_hal::{i2c::I2C, peripherals::Peripherals, prelude::*};
+use mipidsi::{options::Orientation, Display};
 use slint::platform::WindowEvent;
 pub use xtensa_lx_rt::entry;
 
@@ -58,35 +56,30 @@ impl slint::platform::Platform for EspBackend {
 
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         let peripherals = Peripherals::take();
-        let mut system = peripherals.SYSTEM.split();
-        let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock240MHz).freeze();
+        let mut system = SystemControl::new(peripherals.SYSTEM);
+        let clocks = ClockControl::max(system.clock_control).freeze();
 
-        let mut rtc = Rtc::new(peripherals.RTC_CNTL);
-        let timer_group0 =
-            TimerGroup::new(peripherals.TIMG0, &clocks, &mut system.peripheral_clock_control);
-        let mut wdt0 = timer_group0.wdt;
-        let timer_group1 =
-            TimerGroup::new(peripherals.TIMG1, &clocks, &mut system.peripheral_clock_control);
-        let mut wdt1 = timer_group1.wdt;
-
+        let mut rtc = Rtc::new(peripherals.LPWR, None);
         rtc.rwdt.disable();
-        wdt0.disable();
-        wdt1.disable();
+        let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks, None);
+        timer_group0.wdt.disable();
+        let timer_group1 = TimerGroup::new(peripherals.TIMG1, &clocks, None);
+        timer_group1.wdt.disable();
 
         let mut delay = Delay::new(&clocks);
-        let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+        let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
         let i2c = I2C::new(
             peripherals.I2C0,
             io.pins.gpio8,
             io.pins.gpio18,
             400u32.kHz(),
-            &mut system.peripheral_clock_control,
             &clocks,
+            None
         );
 
-        let mut touch = tt21100::TT21100::new(i2c, io.pins.gpio3.into_pull_up_input())
-            .expect("Initialize the touch device");
+        //let mut touch = tt21100::TT21100::new(i2c, io.pins.gpio3.into_pull_up_input())
+        //    .expect("Initialize the touch device");
 
         let sclk = io.pins.gpio7;
         let mosi = io.pins.gpio6;
@@ -104,11 +97,12 @@ impl slint::platform::Platform for EspBackend {
         let dc = io.pins.gpio4.into_push_pull_output();
         let rst = io.pins.gpio48.into_push_pull_output();
 
-        let di = SPIInterfaceNoCS::new(spi, dc);
-        let display = mipidsi::Builder::ili9342c_rgb565(di)
-            .with_orientation(Orientation::PortraitInverted(false))
-            .with_color_order(mipidsi::options::ColorOrder::Bgr)
-            .init(&mut delay, Some(rst))
+        let di = SPIInterface::new(spi, dc);
+        let display = mipidsi::Builder::new(mipidsi::models::ILI9342CRgb565, di)
+            .orientation(Orientation::new().rotate(mipidsi::options::Rotation::Deg90))
+            .color_order(mipidsi::options::ColorOrder::Bgr)
+            .reset_pin(rst)
+            .init(&mut delay)
             .unwrap();
 
         let mut backlight = io.pins.gpio45.into_push_pull_output();
